@@ -30,10 +30,10 @@ namespace CustomToolTemplate
 			CommandLineRe = new Regex(@"^\s*//\s*Command\s+Line\s*:(\s*(?<arg>[^ ]+))+\s*$",
 			                          RegexOptions.IgnoreCase);
 
-			OnGenerateCode += GenerateCode;
+			OnGenerateCode += GenerateOutput;
 		}
 
-		private void GenerateCode(object sender, GenerationEventArgs e)
+		private void GenerateOutput(object sender, GenerationEventArgs e)
 		{
 			string jar = GetInstallPath(@"smc\Smc.jar");
 			if (!File.Exists(jar))
@@ -48,42 +48,13 @@ namespace CustomToolTemplate
 			{
 				tempDir = Directory.CreateDirectory(tempFile + "_dir").FullName;
 
-				List<string> args = CreateArgs(e);
-				args.Insert(0, "-jar");
-				args.Insert(1, jar);
-				args.Add("-d");
-				args.Add(tempDir);
-				args.Add(e.InputFilePath);
+				GenerateSourceCode(jar, e, tempDir);
 
-				ProcessResult proc = Execute(tempDir, "java", args.ToArray());
+				DeleteAllFiles(e, tempDir);
 
-				if (ProcessErrors(e, proc, e.InputFilePath))
-					return;
+				GenerateGraphFile(jar, e, tempDir);
 
-				// Generate output
-
-				HashSet<string> names = GetFileNames(e, tempDir);
-				if (names.Count == 0)
-				{
-					e.GenerateError("Could not create result file (but no error was returned)");
-					return;
-				}
-				if (names.Count > 1)
-				{
-					e.GenerateError("Wrong number of output files created (but no error was returned): " + names.Count);
-					return;
-				}
-
-				string filename = Path.Combine(tempDir, names.First());
-				foreach (var line in File.ReadLines(filename))
-				{
-					e.OutputCode.AppendLine(line);
-				}
-
-				//string inputDir = new FileInfo(e.InputFilePath).DirectoryName;
-
-				//foreach (var name in names)
-				//    File.WriteAllText(Path.Combine(inputDir, name), File.ReadAllText(Path.Combine(tempDir, name)));
+				DeleteAllFiles(e, tempDir);
 
 				//AddProjectItems(e, inputDir, names);
 
@@ -93,14 +64,7 @@ namespace CustomToolTemplate
 			{
 				if (tempDir != null)
 				{
-					foreach (var file in Directory.GetFiles(tempDir))
-					{
-						if (file == "." || file == "..")
-							continue;
-
-						DeleteFile(Path.Combine(tempDir, file), e);
-					}
-
+					DeleteAllFiles(e, tempDir);
 					DeleteDir(tempDir, e);
 				}
 
@@ -108,11 +72,97 @@ namespace CustomToolTemplate
 			}
 		}
 
-		private HashSet<string> GetFileNames(GenerationEventArgs e, string tempDir)
+		private void DeleteAllFiles(GenerationEventArgs e, string tempDir)
+		{
+			foreach (var file in Directory.GetFiles(tempDir))
+			{
+				if (file == "." || file == "..")
+					continue;
+
+				DeleteFile(Path.Combine(tempDir, file), e);
+			}
+		}
+
+		private void GenerateGraphFile(string jar, GenerationEventArgs e, string tempDir)
+		{
+			List<string> args = new List<string>();
+			args.Add("-graph");
+			args.Add("-glevel");
+			args.Add("2");
+			args.Insert(0, "-jar");
+			args.Insert(1, jar);
+			args.Add("-d");
+			args.Add(tempDir);
+			args.Add(e.InputFilePath);
+
+			ProcessResult proc = Execute(tempDir, "java", args.ToArray());
+			if (ProcessErrors(e, proc, e.InputFilePath))
+				return;
+
+			string dotFilename = GetGeneratedFileName(e, tempDir, "*.dot");
+			if (dotFilename == null)
+				return;
+
+			string inputDir = new FileInfo(e.InputFilePath).DirectoryName;
+
+			var imageFilename = Path.Combine(inputDir, Path.GetFileNameWithoutExtension(dotFilename) + ".svg");
+			DeleteFile(imageFilename, e);
+
+			Execute(tempDir, "dot", "-Tsvg", Path.Combine(tempDir, dotFilename), "-o", imageFilename);
+
+			// If could not generate the image, copy the dot file
+			if (!File.Exists(imageFilename))
+				File.WriteAllText(Path.Combine(inputDir, dotFilename), File.ReadAllText(Path.Combine(tempDir, dotFilename)));
+		}
+
+		private void GenerateSourceCode(string jar, GenerationEventArgs e, string tempDir)
+		{
+			List<string> args = CreateArgs(e);
+			args.Insert(0, "-jar");
+			args.Insert(1, jar);
+			args.Add("-d");
+			args.Add(tempDir);
+			args.Add(e.InputFilePath);
+
+			ProcessResult proc = Execute(tempDir, "java", args.ToArray());
+			if (ProcessErrors(e, proc, e.InputFilePath))
+				return;
+
+			// Generate output
+
+			string generatedFilename = GetGeneratedFileName(e, tempDir, "*.cs");
+			if (generatedFilename == null)
+				return;
+
+			string filename = Path.Combine(tempDir, generatedFilename);
+			foreach (var line in File.ReadLines(filename))
+			{
+				e.OutputCode.AppendLine(line);
+			}
+		}
+
+		private string GetGeneratedFileName(GenerationEventArgs e, string tempDir, string extension)
+		{
+			HashSet<string> names = GetFileNames(e, tempDir, extension);
+			if (names.Count == 0)
+			{
+				e.GenerateError("Could not create result file (but no error was returned)");
+				return null;
+			}
+			if (names.Count > 1)
+			{
+				e.GenerateError("Wrong number of output files created (but no error was returned): " + names.Count);
+				return null;
+			}
+
+			return names.First();
+		}
+
+		private HashSet<string> GetFileNames(GenerationEventArgs e, string tempDir, string extension)
 		{
 			HashSet<string> names = new HashSet<string>();
 
-			foreach (var file in Directory.GetFiles(tempDir, "*.cs"))
+			foreach (var file in Directory.GetFiles(tempDir, extension))
 			{
 				var name = new FileInfo(file).Name;
 				names.Add(name);
