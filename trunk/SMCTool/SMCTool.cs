@@ -8,9 +8,10 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using EnvDTE;
 using Microsoft.VisualStudio.Shell;
-using Microsoft.Win32;
 using VSLangProj;
+using Process = System.Diagnostics.Process;
 
 namespace CustomToolTemplate
 {
@@ -19,16 +20,23 @@ namespace CustomToolTemplate
 	[ProvideObject(typeof (SMCTool))]
 	public class SMCTool : CustomToolBase
 	{
-		protected readonly Regex InfoRe;
-		protected readonly Regex ErrorRe;
+		private static string _installPath;
 		protected readonly Regex CommandLineRe;
+		protected readonly Regex DotCommandLineRe;
+		protected readonly Regex ErrorRe;
+		protected readonly Regex GraphCommandLineRe;
+		protected readonly Regex InfoRe;
 
 		public SMCTool()
 		{
 			InfoRe = new Regex(@"\[(?<info>.*)\]");
 			ErrorRe = new Regex(@":(?<line>\d+): (?<level>[^ ]+) - (?<err>.*)");
-			CommandLineRe = new Regex(@"^\s*//\s*Command\s+Line\s*:(\s*(?<arg>[^ ]+))+\s*$",
+			CommandLineRe = new Regex(@"^Command\s+Line\s*:(\s*(?<arg>[^ ]+))+$",
 			                          RegexOptions.IgnoreCase);
+			GraphCommandLineRe = new Regex(@"^Graph\s+Command\s+Line\s*:(\s*(?<arg>[^ ]+))+$",
+			                               RegexOptions.IgnoreCase);
+			DotCommandLineRe = new Regex(@"^dot\s+Command\s+Line\s*:(\s*(?<arg>[^ ]+))+$",
+			                             RegexOptions.IgnoreCase);
 
 			OnGenerateCode += GenerateOutput;
 		}
@@ -74,7 +82,7 @@ namespace CustomToolTemplate
 
 		private void DeleteAllFiles(GenerationEventArgs e, string tempDir)
 		{
-			foreach (var file in Directory.GetFiles(tempDir))
+			foreach (string file in Directory.GetFiles(tempDir))
 			{
 				if (file == "." || file == "..")
 					continue;
@@ -85,10 +93,11 @@ namespace CustomToolTemplate
 
 		private void GenerateGraphFile(string jar, GenerationEventArgs e, string tempDir)
 		{
-			List<string> args = new List<string>();
-			args.Add("-graph");
-			args.Add("-glevel");
-			args.Add("2");
+			string inputDir = new FileInfo(e.InputFilePath).DirectoryName;
+
+			// Generate dot file
+
+			List<string> args = CreateArgs(e, GraphCommandLineRe, "-graph", "-glevel", "0");
 			args.Insert(0, "-jar");
 			args.Insert(1, jar);
 			args.Add("-d");
@@ -103,21 +112,43 @@ namespace CustomToolTemplate
 			if (dotFilename == null)
 				return;
 
-			string inputDir = new FileInfo(e.InputFilePath).DirectoryName;
+			// Generate image using dot
 
-			var imageFilename = Path.Combine(inputDir, Path.GetFileNameWithoutExtension(dotFilename) + ".svg");
-			DeleteFile(imageFilename, e);
+			args = CreateArgs(e, DotCommandLineRe, "-Tsvg");
 
-			Execute(tempDir, "dot", "-Tsvg", Path.Combine(tempDir, dotFilename), "-o", imageFilename);
+			string imageExtension = (from a in args
+			                         where a.StartsWith("-T")
+			                         select a.Substring(2)).FirstOrDefault();
+			if (imageExtension == null)
+			{
+				e.GenerateError("Missing -T argument for dot");
+				return;
+			}
 
-			// If could not generate the image, copy the dot file
-			if (!File.Exists(imageFilename))
-				File.WriteAllText(Path.Combine(inputDir, dotFilename), File.ReadAllText(Path.Combine(tempDir, dotFilename)));
+			string imageFilename = Path.GetFileNameWithoutExtension(dotFilename) + "." + imageExtension;
+			string imageFullPath = Path.Combine(inputDir, imageFilename);
+			DeleteFile(imageFullPath, e);
+
+			args.Add(Path.Combine(tempDir, dotFilename));
+			args.Add("-o");
+			args.Add(imageFullPath);
+			Execute(tempDir, "dot", args.ToArray());
+
+			// Copy dot to input dir
+			File.WriteAllText(Path.Combine(inputDir, dotFilename), File.ReadAllText(Path.Combine(tempDir, dotFilename)));
+
+			// Add files to solution
+			var toAdd = new HashSet<string>();
+			toAdd.Add(dotFilename);
+			if (File.Exists(imageFullPath))
+				toAdd.Add(imageFilename);
+
+			AddProjectItems(e, inputDir, toAdd);
 		}
 
 		private void GenerateSourceCode(string jar, GenerationEventArgs e, string tempDir)
 		{
-			List<string> args = CreateArgs(e);
+			List<string> args = CreateArgs(e, CommandLineRe, "-csharp", "-reflect", "-generic");
 			args.Insert(0, "-jar");
 			args.Insert(1, jar);
 			args.Add("-d");
@@ -135,7 +166,7 @@ namespace CustomToolTemplate
 				return;
 
 			string filename = Path.Combine(tempDir, generatedFilename);
-			foreach (var line in File.ReadLines(filename))
+			foreach (string line in File.ReadLines(filename))
 			{
 				e.OutputCode.AppendLine(line);
 			}
@@ -160,11 +191,11 @@ namespace CustomToolTemplate
 
 		private HashSet<string> GetFileNames(GenerationEventArgs e, string tempDir, string extension)
 		{
-			HashSet<string> names = new HashSet<string>();
+			var names = new HashSet<string>();
 
-			foreach (var file in Directory.GetFiles(tempDir, extension))
+			foreach (string file in Directory.GetFiles(tempDir, extension))
 			{
-				var name = new FileInfo(file).Name;
+				string name = new FileInfo(file).Name;
 				names.Add(name);
 			}
 
@@ -173,9 +204,9 @@ namespace CustomToolTemplate
 
 		private void AddProjectItems(GenerationEventArgs e, string dir, HashSet<string> names)
 		{
-			HashSet<string> existingNames = new HashSet<string>();
+			var existingNames = new HashSet<string>();
 
-			foreach (EnvDTE.ProjectItem item in e.ProjectItem.ProjectItems)
+			foreach (ProjectItem item in e.ProjectItem.ProjectItems)
 			{
 				if (!names.Contains(item.Name))
 				{
@@ -188,7 +219,7 @@ namespace CustomToolTemplate
 				}
 			}
 
-			foreach (var name in names)
+			foreach (string name in names)
 			{
 				if (existingNames.Contains(name))
 					continue;
@@ -204,9 +235,9 @@ namespace CustomToolTemplate
 			if (proc.StdErr.Trim() != "")
 			{
 				// Parse errors
-				foreach (var line in proc.StdErr.Split('\r', '\n'))
+				foreach (string line in proc.StdErr.Split('\r', '\n'))
 				{
-					var err = line.Trim();
+					string err = line.Trim();
 					if (err == "")
 						continue;
 
@@ -255,7 +286,7 @@ namespace CustomToolTemplate
 				if (!File.Exists(dll))
 					throw new FileNotFoundException("Missing intalled file", dll);
 
-				VSProject project = (VSProject) e.ProjectItem.ContainingProject.Object;
+				var project = (VSProject) e.ProjectItem.ContainingProject.Object;
 				bool hasRef =
 					project.References.Cast<Reference>().Any(
 						r =>
@@ -273,18 +304,24 @@ namespace CustomToolTemplate
 			}
 		}
 
-		private List<string> CreateArgs(GenerationEventArgs e)
+		private List<string> CreateArgs(GenerationEventArgs e, Regex regex, params string[] defaults)
 		{
-			List<string> args = new List<string>();
+			var args = new List<string>();
 
-			var pos = e.InputText.IndexOfAny(new[] {'\r', '\n'});
-			if (pos > 0)
+			string[] lines = e.InputText.Split('\r', '\n');
+			for (int i = 0; i < 3; i++)
 			{
-				var firstLine = e.InputText.Substring(0, pos);
-				var match = CommandLineRe.Match(firstLine);
+				string line = lines[i].Trim();
+
+				if (!line.StartsWith("//"))
+					break;
+
+				line = line.Substring(2).Trim();
+
+				Match match = regex.Match(line);
 				if (match.Success)
 				{
-					foreach (var capture in match.Groups["arg"].Captures)
+					foreach (object capture in match.Groups["arg"].Captures)
 					{
 						args.Add(capture.ToString().Trim());
 					}
@@ -293,29 +330,20 @@ namespace CustomToolTemplate
 			}
 
 			// If get to here no args defined, so use default
-			args.Add("-csharp");
-			args.Add("-reflect");
-			args.Add("-generic");
+			args.AddRange(defaults);
 			return args;
-		}
-
-		private class ProcessResult
-		{
-			public int Result;
-			public string StdOut;
-			public string StdErr;
 		}
 
 		private ProcessResult Execute(string workingDir, string cmd, params string[] args)
 		{
-			ProcessResult result = new ProcessResult();
+			var result = new ProcessResult();
 
-			using (Process proc = new Process())
+			using (var proc = new Process())
 			{
 				proc.StartInfo.WorkingDirectory = workingDir;
 				proc.StartInfo.FileName = cmd;
 
-				StringBuilder sb = new StringBuilder();
+				var sb = new StringBuilder();
 				for (int i = 0; i < args.Length; i++)
 				{
 					if (i > 0)
@@ -330,7 +358,7 @@ namespace CustomToolTemplate
 				proc.StartInfo.RedirectStandardError = true;
 				proc.StartInfo.UseShellExecute = false;
 
-				StringBuilder stdout = new StringBuilder();
+				var stdout = new StringBuilder();
 				proc.OutputDataReceived +=
 					(sender, e) => { if (!String.IsNullOrEmpty(e.Data)) stdout.AppendLine(e.Data); };
 
@@ -370,8 +398,6 @@ namespace CustomToolTemplate
 			}
 		}
 
-		private static string _installPath;
-
 		public static string GetInstallPath(string filename = null)
 		{
 			if (_installPath == null)
@@ -379,6 +405,17 @@ namespace CustomToolTemplate
 
 			return string.IsNullOrEmpty(filename) ? _installPath : Path.Combine(_installPath, filename);
 		}
+
+		#region Nested type: ProcessResult
+
+		private class ProcessResult
+		{
+			public int Result;
+			public string StdErr;
+			public string StdOut;
+		}
+
+		#endregion
 
 		//#region COM Register 
 
