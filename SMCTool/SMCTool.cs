@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -93,6 +94,13 @@ namespace CustomToolTemplate
 
 		private void GenerateGraphFile(string jar, GenerationEventArgs e, string tempDir)
 		{
+			const string graphvizCommandLine = "dot";
+			
+			if (!ExistsOnPath(graphvizCommandLine))
+			{
+				return;
+			}
+
 			string inputDir = new FileInfo(e.InputFilePath).DirectoryName;
 
 			// Generate dot file
@@ -132,7 +140,7 @@ namespace CustomToolTemplate
 			args.Add(Path.Combine(tempDir, dotFilename));
 			args.Add("-o");
 			args.Add(imageFullPath);
-			Execute(tempDir, "dot", args.ToArray());
+			Execute(tempDir, graphvizCommandLine, args.ToArray());
 
 			// Copy dot to input dir
 			File.WriteAllText(Path.Combine(inputDir, dotFilename), File.ReadAllText(Path.Combine(tempDir, dotFilename)));
@@ -146,6 +154,32 @@ namespace CustomToolTemplate
 			AddProjectItems(e, inputDir, toAdd);
 		}
 
+		private static bool ExistsOnPath(string exeName)
+		{
+			try
+			{
+				using (var p = new Process())
+				{
+					p.StartInfo.FileName = "where";
+					p.StartInfo.Arguments = exeName;
+
+					p.StartInfo.CreateNoWindow = true;
+					p.StartInfo.WindowStyle = ProcessWindowStyle.Hidden;
+					p.StartInfo.RedirectStandardOutput = true;
+					p.StartInfo.RedirectStandardError = true;
+					p.StartInfo.UseShellExecute = false;
+
+					p.Start();
+					p.WaitForExit();
+					return p.ExitCode == 0;
+				}
+			}
+			catch (Win32Exception)
+			{
+				throw new Exception("'where' command is not on path");
+			}
+		}
+		
 		private void GenerateSourceCode(string jar, GenerationEventArgs e, string tempDir)
 		{
 			List<string> args = CreateArgs(e, CommandLineRe, "-csharp", "-reflect", "-generic");
@@ -306,32 +340,41 @@ namespace CustomToolTemplate
 
 		private List<string> CreateArgs(GenerationEventArgs e, Regex regex, params string[] defaults)
 		{
-			var args = new List<string>();
-
-			string[] lines = e.InputText.Split('\r', '\n');
-			for (int i = 0; i < 3; i++)
+			var lines = e.InputText.Split('\n');
+			
+			for (var i = 0; i < lines.Length; i++)
 			{
-				string line = lines[i].Trim();
+				var line = lines[i].Trim();
+
+				if (line.Length == 0)
+				{
+					continue;
+				}
 
 				if (!line.StartsWith("//"))
-					break;
-
-				line = line.Substring(2).Trim();
-
-				Match match = regex.Match(line);
-				if (match.Success)
 				{
-					foreach (object capture in match.Groups["arg"].Captures)
-					{
-						args.Add(capture.ToString().Trim());
-					}
-					return args;
+					break;
 				}
+
+				var comment = line.Substring(2);
+				var match = regex.Match(comment);
+
+				if (!match.Success)
+				{
+					continue;
+				}
+
+				var args = new List<string>();
+				
+				foreach (var capture in match.Groups["arg"].Captures)
+				{
+					args.Add(capture.ToString().Trim());
+				}
+				
+				return args;
 			}
 
-			// If get to here no args defined, so use default
-			args.AddRange(defaults);
-			return args;
+			return defaults.ToList();
 		}
 
 		private ProcessResult Execute(string workingDir, string cmd, params string[] args)
